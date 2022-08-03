@@ -43,8 +43,6 @@ import (
 	"barista.run/modules/diskio"
 	"barista.run/modules/diskspace"
 	"barista.run/modules/funcs"
-
-	//"barista.run/modules/github"
 	"barista.run/modules/media"
 	"barista.run/modules/meminfo"
 	"barista.run/modules/meta/split"
@@ -53,18 +51,19 @@ import (
 	"barista.run/modules/sysinfo"
 	"barista.run/modules/volume"
 	"barista.run/modules/volume/alsa"
-	"barista.run/modules/wlan"
 	"barista.run/oauth"
 	"barista.run/outputs"
 	"barista.run/pango"
+	"barista.run/pango/icons/fontawesome"
 	"barista.run/pango/icons/mdi"
 	"barista.run/pango/icons/typicons"
 
-	"github.com/martinohmann/barista-contrib/modules/keyboard"
-	"github.com/martinohmann/barista-contrib/modules/keyboard/xkbmap"
-
+	"github.com/chlunde/status-bar/wlan"
+	"github.com/dustin/go-humanize"
 	colorful "github.com/lucasb-eyer/go-colorful"
 	"github.com/martinlindhe/unit"
+	"github.com/martinohmann/barista-contrib/modules/keyboard"
+	"github.com/martinohmann/barista-contrib/modules/keyboard/xkbmap"
 	keyring "github.com/zalando/go-keyring"
 )
 
@@ -221,9 +220,15 @@ func threshold(out *bar.Segment, urgent bool, color ...bool) *bar.Segment {
 	return out
 }
 
+func bitrate(v unit.Datarate) string {
+	intval := uint64(v.BitsPerSecond())
+	return fmt.Sprintf("%s/s", strings.Replace(humanize.Bytes(intval), "B", "bit", 1))
+}
+
 func main() {
 	mdi.Load(home(".local/share/fonts/MaterialDesign-Webfont"))
 	typicons.Load(home(".local/share/fonts/typicons.font"))
+	fontawesome.Load(home(".local/share/fonts/Font-Awesome"))
 
 	colors.LoadBarConfig()
 	if colors.Scheme("background") == nil {
@@ -232,6 +237,7 @@ func main() {
 	if colors.Scheme("statusline") == nil {
 		colors.Set("statusline", color.White)
 	}
+	colors.Set("focused_workspace_border", color.White)
 	bg := colors.Scheme("background")
 	fg := colors.Scheme("statusline")
 	if fg != nil && bg != nil {
@@ -327,37 +333,38 @@ func main() {
 		return out
 	}), 1)
 
-	wifi := wlan.Any().Output(func(i wlan.Info) bar.Output {
+	wifiName, wifiDetails := split.New(wlan.Any().Output(func(i wlan.Info) bar.Output {
 		if !i.Connecting() && !i.Connected() {
-			return outputs.Pango(pango.Icon("mdi-wifi").Alpha(0.6), "...").
-				Color(colors.Scheme("bad"))
+			mainModalController.SetOutput("network", makeIconOutput("mdi-ethernet"))
+			return nil
 		}
+		mainModalController.SetOutput("network", makeIconOutput("mdi-wifi"))
 		if i.Connecting() {
 			return outputs.Pango(pango.Icon("mdi-wifi").Alpha(0.6), "...").
 				Color(colors.Scheme("degraded"))
 		}
 		out := outputs.Group()
-		out.Color(colors.Scheme("good"))
-		//out.Border(color.RGBA{0, 0, 0xab, 0xff})
-		out.Color(color.RGBA{0, 0, 0xab, 0xff})
 		// First segment shown in summary mode only.
+		out.Append(outputs.Pango(
+			pango.Icon("mdi-wifi").Alpha(0.6),
+			pango.Text(truncate(i.SSID, -9)),
+		).OnClick(click.Left(func() {
+			mainModalController.Toggle("network")
+		})))
 		// Full name, frequency, bssid in detail mode
 		out.Append(outputs.Pango(
 			pango.Icon("mdi-wifi").Alpha(0.6),
 			pango.Text(i.SSID),
 		))
-		if i.Frequency.Gigahertz() > 0 {
-			out.Append(outputs.Textf("%2.1fGHz", i.Frequency.Gigahertz()))
-		}
-
-		if i.AccessPointMAC != "" {
-			out.Append(outputs.Pango(
-				pango.Icon("mdi-access-point").Alpha(0.8),
-				pango.Text(i.AccessPointMAC).Small(),
-			))
-		}
+		out.Append(outputs.Textf("%2.1fG", i.Frequency.Gigahertz()))
+		out.Append(outputs.Textf("TX:%s", bitrate(i.TransmitBitrate)))
+		out.Append(outputs.Textf("RX:%s", bitrate(i.ReceiveBitrate)))
+		out.Append(outputs.Pango(
+			pango.Icon("mdi-access-point").Alpha(0.8),
+			pango.Text(i.AccessPointMAC).Small(),
+		))
 		return out
-	})
+	}), 1)
 
 	vol := volume.New(alsa.DefaultMixer()).Output(func(v volume.Volume) bar.Output {
 		if v.Mute {
@@ -502,7 +509,7 @@ func main() {
 	var homeDiskspace bar.Module
 	if deviceForMountPath(home()) != rootDev {
 		homeDiskspace = diskspace.New(home()).Output(func(i diskspace.Info) bar.Output {
-			return formatDiskSpace(i, "typecn-home-outline")
+			return formatDiskSpace(i, "mdi-home-outline")
 		})
 	}
 	rootDiskspace := diskspace.New("/").Output(func(i diskspace.Info) bar.Output {
@@ -513,7 +520,7 @@ func main() {
 		Output(func(r diskio.IO) bar.Output {
 			return pango.Icon("mdi-swap-vertical").
 				Concat(spacer).
-				ConcatText(format.IByterate(r.Total()))
+				ConcatText(fmt.Sprintf("%9s", format.IByterate(r.Total())))
 		})
 
 	mediaSummary, mediaDetail := split.New(media.Auto().Output(mediaFormatFunc), 1)
@@ -575,6 +582,9 @@ query AssignedSearch {
 
 	bbModule := funcs.Every(1*time.Minute, func(s bar.Sink) {
 		s.Output(outputs.Text("..."))
+		if bbDomain == nil {
+			return
+		}
 		req, err := http.NewRequest("GET", "https://"+string(bbDomain)+"/rest/api/1.0/dashboard/pull-requests?state=OPEN&role=REVIEWER", nil)
 		if err != nil {
 			s.Output(outputs.Textf("ERR:%v", err.Error()))
@@ -654,9 +664,13 @@ query AssignedSearch {
 		sysMode.Detail(homeDiskspace)
 	}
 	sysMode.Detail(rootDiskspace, mainDiskio)
+	mainModal.Mode("network").
+		SetOutput(makeIconOutput("mdi-ethernet")).
+		Summary(wifiName).
+		Detail(wifiDetails, net, netsp)
 	mainModal.Mode("media").
 		SetOutput(makeIconOutput("mdi-music-box")).
-		Add(mediaSummary).
+		Add(vol, mediaSummary).
 		Detail(mediaDetail)
 	mainModal.Mode("battery").
 		// Filled in by the battery module if one is available.
@@ -664,21 +678,15 @@ query AssignedSearch {
 		Summary(battSummary).
 		Detail(battDetail)
 	mainModal.Mode("timezones").
-		SetOutput(makeIconOutput("mdi-map")).
+		SetOutput(makeIconOutput("mdi-calendar-clock")).
 		Detail(makeTzClock("Seattle", "America/Los_Angeles")).
 		Detail(makeTzClock("New York", "America/New_York")).
 		Detail(makeTzClock("UTC", "Etc/UTC")).
 		Detail(makeTzClock("Oslo", "Europe/Oslo")).
+		Detail(makeTzClock("Tokyo", "Asia/Tokyo")).
 		Add(localdate)
 
 	var mm bar.Module
 	mm, mainModalController = mainModal.Build()
-	modules := []bar.Module{
-		mm, vol, wifi, net, netsp, gpd, kbd, ghModule,
-	}
-	if bbDomain != nil {
-		modules = append(modules, bbModule)
-	}
-	modules = append(modules, localtime)
-	panic(barista.Run(modules...))
+	panic(barista.Run(mm, gpd, kbd, bbModule, ghModule, localtime))
 }
